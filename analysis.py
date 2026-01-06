@@ -28,12 +28,19 @@ def main():
   )
 
   parser.add_argument(
-    "--n",
-    type=float,
-    default=2.0,
-    help="Reaction order"
+    "--nmin",
+    type=int,
+    default=1,
+    help="Minimum reaction order"
   )
 
+  parser.add_argument(
+    "--nmax",
+    type=int,
+    default=3,
+    help="Maximum reaction order"
+  )
+  
   parser.add_argument(
     "--kelong",
     type=float,
@@ -47,7 +54,7 @@ def main():
   t, I_ratio = load_csv(args.data)
   
   # convert to conc
-  p_exp = i_to_conc(I_ratio, args.p0)
+  P_exp = i_to_conc(I_ratio, args.p0)
 
   # initial guesses for fitting
   theta0 = [1e-3, args.n, args.kelong]
@@ -56,7 +63,7 @@ def main():
   def A_func(t):
     return 1.0 # just a placeholder
 
-  best_rmse = n.inf
+  best_rmse = np.inf
   best_result = None
   best_n = None
 
@@ -79,7 +86,7 @@ def main():
 
     # compute RMSE
     keff_fit, kelong_fit = result.x
-    params_fit = {"keff": keff_fit, "n": n_candidate "kelong": kelong_fit}
+    params_fit = {"keff": keff_fit, "n": n_candidate, "kelong": kelong_fit}
     sol = solve_kinetics(
       t_span=(t[0], t[-1]),
       P0=args.p0,
@@ -97,7 +104,7 @@ def main():
       best_stats = stats
 
   # Output
-  print(Best fit parameters:)
+  print("Best fit parameters:")
   print(f" n = {best_result['n']}")
   print(f" keff = {best_result['keff']}")
   print(f" kelong = {best_result['kelong']}")
