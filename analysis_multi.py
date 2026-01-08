@@ -38,15 +38,13 @@ def fit_independent_peaks(t, I_matrix, peak_names, nmin, nmax, kelong_guess, A_f
     for i, peak in enumerate(peak_names):
         I_raw = I_matrix[:, i]
         
-        # Skip if array is empty or all NaNs
         if I_raw.size == 0 or np.all(np.isnan(I_raw)):
             continue
             
         max_val = np.nanmax(I_raw)
-        if max_val <= 0: continue
+        if max_val <= 0 or np.isnan(max_val): continue
         
         P_exp = I_raw / max_val 
-        # Use Rise/Fall if peak is 5% higher than starting point
         model_type = 'rise_fall' if max_val > I_raw[0] * 1.05 else 'standard'
         
         best_rmse = np.inf
@@ -75,9 +73,8 @@ def fit_independent_peaks(t, I_matrix, peak_names, nmin, nmax, kelong_guess, A_f
                 except: continue
         if best_fit: 
             summary.append(best_fit)
-        
         if (i+1) % 20 == 0:
-            print(f"  Progress: {i+1}/{total} peaks...")
+            print(f"  Progress: {i+1}/{total} peaks fitted...")
             
     return summary
 
@@ -91,51 +88,63 @@ def main():
     args = parser.parse_args()
 
     try:
-        # Load the CSV. header=0 makes the first row (the times) the columns.
-        # index_col=0 makes the first column (the residue names) the rows.
+        # Load the CSV. header=0 (first row is time), index_col=0 (first column is residue)
         df = pd.read_csv(args.data, index_col=0)
 
-        # Transpose so Rows = Time, Columns = Residue names
+        # Transpose so index = Time, columns = Residue
         df = df.T
         
-        # Clean the index (convert timestamps from strings/headers to floats)
+        # Clean the index (convert timestamps from headers to floats)
+        # We drop any index values that cannot be converted to numbers (like 'time')
         df.index = pd.to_numeric(df.index, errors='coerce')
-        
-        # Drop the row that likely says 'time' in the index if it exists
         df = df[df.index.notnull()]
-        df = df.sort_index()
         
-        # Clean the intensity data
+        # Clean the data (ensure all values are floats)
         df = df.apply(pd.to_numeric, errors='coerce')
+        
+        # Interpolate missing points
         df = df.interpolate(method='linear', axis=0).fillna(method='bfill').fillna(method='ffill')
 
-        t = df.index.values
+        # FINAL CHECK: Ensure we actually have data
+        if df.empty:
+            raise ValueError("The resulting dataframe is empty after numeric conversion.")
+
+        t = df.index.values.astype(float)
         peak_names = df.columns.tolist()
         I_matrix = df.values.astype(float)
         
+        # Check for monotonicity (Time must only increase)
+        if not np.all(np.diff(t) > 0):
+            print("Warning: Time points were not sorted. Sorting now...")
+            idx = np.argsort(t)
+            t = t[idx]
+            I_matrix = I_matrix[idx, :]
+
         print(f"Successfully Loaded:")
-        print(f"- {len(t)} Timepoints (from {t[0]} to {t[-1]} seconds)")
+        print(f"- {len(t)} Timepoints (Range: {t[0]} to {t[-1]} seconds)")
         print(f"- {len(peak_names)} Residues")
     except Exception as e:
-        print(f"Error reading CSV: {e}")
-        sys.exit(1)
-
-    if len(t) == 0:
-        print("Error: No timepoints found. Check the format of your CSV headers.")
+        print(f"Fatal Error: {e}")
         sys.exit(1)
 
     def A_func(t): return 1.0 
-    print(f"Starting fitting...")
+    print(f"Starting fits...")
     summary = fit_independent_peaks(t, I_matrix, peak_names, args.nmin, args.nmax, args.kelong, A_func)
     
     if not summary:
-        print("All fits failed. Check your initial guesses.")
+        print("All fits failed. Please check your data scaling.")
         sys.exit(1)
 
-    with open("fit_summary_independent.csv", "w") as f:
-        f.write("peak,type,n,keff,kelong,krise,RMSE\n")
-        for res in summary:
-            f.write(f"{res['peak']},{res['type']},{res['n']},{res['keff']:.3e},{res['kelong']:.3e},{res['krise']:.3e},{res['stats']['RMSE']:.2e}\n")
+    # Save to CSV
+    res_df = pd.DataFrame([
+        {
+            "peak": r["peak"], "type": r["type"], "n": r["n"], 
+            "keff": r["keff"], "kelong": r["kelong"], "krise": r["krise"], 
+            "RMSE": r["stats"]["RMSE"]
+        } for r in summary
+    ])
+    res_df.to_csv("fit_summary_independent.csv", index=False)
+    
     print(f"Success! Results saved to fit_summary_independent.csv")
 
 if __name__ == "__main__":
