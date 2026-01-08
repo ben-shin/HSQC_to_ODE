@@ -58,7 +58,7 @@ def fit_global_peaks(t, I_matrix, P0, peak_names, nmin, nmax, kelong_guess, A_fu
       res = []
       params = {"keff": keff_fit, "n": n_candidate, "kelong": kelong_fit}
       for i in range(P_exp_all.shape[0]):
-        sol = solve_kinetics((t[0], t[-1], P0, params_fit, A_func, t_eval=t)
+        sol = solve_kinetics((t[0], t[-1], P0, params_fit, A_func, t_eval=t))
         P_model = sol.y[0]
         P_model_matrix.append(P_model)
         stats = fit_statistics(P_exp_all[i], P_model)
