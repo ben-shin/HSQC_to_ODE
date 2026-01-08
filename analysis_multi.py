@@ -3,22 +3,41 @@ import numpy as np
 import warnings
 from scipy.optimize import least_squares
 
+# Silence version warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 try:
-    from load import load_csv
     from i_to_conc import i_to_conc
-    from ode import dP_dt, solve_kinetics
+    from ode import solve_kinetics
     from stats import fit_statistics
     from fit import residuals
 except ImportError as e:
-    print(f"Module Import Error: {e}. Ensure all helper .py files are in the folder.")
+    print(f"Import Error: {e}. Check helper files.")
 
-def safe_residuals(theta, t, P_exp, P0, n, A_func):
-    """Wraps the residual function to prevent non-finite values from crashing the solver."""
+def safe_residuals(theta, t, P_exp, P0, n, A_func, model_type):
+    """
+    theta: [keff, kelong, krise]
+    model_type: 'standard' or 'rise_fall'
+    """
+    keff, kelong, krise = theta
+    params = {'keff': keff, 'n': n, 'kelong': kelong, 'krise': krise}
+    
+    # If standard decay, we force krise to be very fast so it doesn't affect the fit
+    if model_type == 'standard':
+        params['krise'] = 1e5
+        params['f_visible'] = 1.0
+    else:
+        params['f_visible'] = P_exp[0] / np.max(P_exp) # Estimate initial visible fraction
+
     try:
-        res = residuals([theta[0], n, theta[1]], t, P_exp, P0, A_func)
-        # If the ODE solver fails or produces NaNs, return a very large penalty
+        sol = solve_kinetics((t[0], t[-1]), P0, params, A_func, t_eval=t)
+        if not sol.success:
+            return np.ones(len(t)) * 1e10
+        
+        # We compare experimental data to the VISIBLE pool (y[1])
+        P_model = sol.y[1]
+        res = P_exp - P_model
+        
         if not np.all(np.isfinite(res)):
             return np.ones(len(t)) * 1e10
         return res
@@ -30,43 +49,48 @@ def fit_independent_peaks(t, I_matrix, P0, peak_names, nmin, nmax, kelong_guess,
     P_model_matrix = []
 
     for i, peak in enumerate(peak_names):
-        I_ratio = I_matrix[:, i]
-        P_exp = i_to_conc(I_ratio, P0)
+        I_raw = I_matrix[:, i]
+        # Detect if peak rises significantly (>5% above start)
+        max_val = np.max(I_raw)
+        model_type = 'rise_fall' if max_val > I_raw[0] * 1.05 else 'standard'
         
-        # Skip if data is bad
-        if not np.all(np.isfinite(P_exp)):
-            continue
+        # Normalize to the maximum observed intensity to keep math stable
+        P_exp = i_to_conc(I_raw / max_val, P0)
 
         best_rmse = np.inf
         best_fit = None
 
-        for n_candidate in range(nmin, nmax + 1):
-            # Smaller keff guess (1e-8) prevents the ODE from blowing up at t=0
-            theta0 = [1e-8, kelong_guess] 
+        for n_cand in range(nmin, nmax + 1):
+            # [keff, kelong, krise]
+            theta0 = [1e-8, kelong_guess, 1e-4]
+            
+            # Lower bound for krise is small; upper bound is effectively infinite
+            bounds = ([0, 0, 0], [np.inf, np.inf, np.inf])
 
             try:
-                result = least_squares(
-                    safe_residuals, 
-                    theta0, 
-                    args=(t, P_exp, P0, n_candidate, A_func),
-                    bounds=([0, 0], [np.inf, np.inf]),
-                    ftol=1e-4 # Slight tolerance increase for stability
+                res_lsq = least_squares(
+                    safe_residuals, theta0, 
+                    args=(t, P_exp, P0, n_cand, A_func, model_type),
+                    bounds=bounds, ftol=1e-3
                 )
                 
-                keff_fit, kelong_fit = result.x
-                params_fit = {"keff": keff_fit, "n": n_candidate, "kelong": kelong_fit}
+                keff_f, kelong_f, krise_f = res_lsq.x
+                p_final = {'keff': keff_f, 'n': n_cand, 'kelong': kelong_f, 
+                           'krise': krise_f if model_type == 'rise_fall' else 1e5,
+                           'f_visible': P_exp[0]/np.max(P_exp) if model_type == 'rise_fall' else 1.0}
                 
-                sol = solve_kinetics((t[0], t[-1]), P0, params_fit, A_func, t_eval=t)
-                P_model = sol.y[0]
+                sol = solve_kinetics((t[0], t[-1]), P0, p_final, A_func, t_eval=t)
+                P_model = sol.y[1]
                 stats = fit_statistics(P_exp, P_model)
 
                 if stats["RMSE"] < best_rmse:
                     best_rmse = stats["RMSE"]
                     best_fit = {
-                        "peak": peak, "n": n_candidate, "keff": keff_fit, 
-                        "kelong": kelong_fit, "P_model": P_model, "stats": stats
+                        "peak": peak, "n": n_cand, "keff": keff_f, "kelong": kelong_f, 
+                        "krise": p_final['krise'], "type": model_type, 
+                        "P_model": P_model, "stats": stats
                     }
-            except Exception:
+            except:
                 continue
 
         if best_fit:
@@ -75,54 +99,13 @@ def fit_independent_peaks(t, I_matrix, P0, peak_names, nmin, nmax, kelong_guess,
 
     return summary, np.column_stack(P_model_matrix)
 
-def fit_global_peaks(t, I_matrix, P0, peak_names, nmin, nmax, kelong_guess, A_func):
-    P_exp_all = np.array([i_to_conc(I_matrix[:, i], P0) for i in range(I_matrix.shape[1])])
-    
-    best_rmse_global = np.inf
-    best_fit_global = None
-    best_P_model_global = None
-
-    for n_candidate in range(nmin, nmax + 1):
-        theta0 = [1e-8, kelong_guess]
-
-        def global_res_wrapper(theta):
-            all_res = []
-            for i in range(P_exp_all.shape[0]):
-                res = safe_residuals(theta, t, P_exp_all[i], P0, n_candidate, A_func)
-                all_res.extend(res)
-            return np.array(all_res)
-
-        try:
-            result = least_squares(global_res_wrapper, theta0, bounds=([0,0],[np.inf,np.inf]))
-            keff_fit, kelong_fit = result.x
-            
-            rmses = []
-            current_models = []
-            params_final = {"keff": keff_fit, "n": n_candidate, "kelong": kelong_fit}
-            
-            for i in range(P_exp_all.shape[0]):
-                sol = solve_kinetics((t[0], t[-1]), P0, params_final, A_func, t_eval=t)
-                current_models.append(sol.y[0])
-                stats = fit_statistics(P_exp_all[i], sol.y[0])
-                rmses.append(stats["RMSE"])
-            
-            avg_rmse = np.mean(rmses)
-            if avg_rmse < best_rmse_global:
-                best_rmse_global = avg_rmse
-                best_fit_global = {"n": n_candidate, "keff": keff_fit, "kelong": kelong_fit, "stats": {"RMSE": avg_rmse}}
-                best_P_model_global = np.column_stack(current_models)
-        except Exception:
-            continue
-
-    return best_fit_global, best_P_model_global
-
 def main():
-    parser = argparse.ArgumentParser(description="Multi peak kinetic fitting")
+    parser = argparse.ArgumentParser(description="FapC Rise and Fall Kinetic Fitting")
     parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--p0", type=float, required=True)
     parser.add_argument("--nmin", type=int, default=1)
     parser.add_argument("--nmax", type=int, default=4)
-    parser.add_argument("--kelong", type=float, default=0.00001)
+    parser.add_argument("--kelong", type=float, default=1e-5)
     args = parser.parse_args()
 
     raw = np.genfromtxt(args.data, delimiter=",", names=True)
@@ -132,24 +115,15 @@ def main():
 
     def A_func(t): return 1.0 
 
-    print(f"Fitting {len(peak_names)} peaks independently...")
+    print(f"Processing {len(peak_names)} peaks...")
     summary_ind, P_model_ind = fit_independent_peaks(t, I_matrix, args.p0, peak_names, args.nmin, args.nmax, args.kelong, A_func)
     
     with open("fit_summary_independent.csv", "w") as f:
-        f.write("peak,n,keff,kelong,RMSE,MAE\n")
+        f.write("peak,type,n,keff,kelong,krise,RMSE\n")
         for res in summary_ind:
-            f.write(f"{res['peak']},{res['n']},{res['keff']:.5e},{res['kelong']:.5e},{res['stats']['RMSE']:.2e},{res['stats']['MAE']:.2e}\n")
+            f.write(f"{res['peak']},{res['type']},{res['n']},{res['keff']:.3e},{res['kelong']:.3e},{res['krise']:.3e},{res['stats']['RMSE']:.2e}\n")
 
-    print("Running Global Fit...")
-    best_fit_global, P_model_global = fit_global_peaks(t, I_matrix, args.p0, peak_names, args.nmin, args.nmax, args.kelong, A_func)
-
-    if best_fit_global:
-        with open("fit_summary_global.csv", "w") as f:
-            f.write("n,keff,kelong,RMSE\n")
-            f.write(f"{best_fit_global['n']},{best_fit_global['keff']:.5e},{best_fit_global['kelong']:.5e},{best_fit_global['stats']['RMSE']:.2e}\n")
-        print(f"Global Fit Results: n={best_fit_global['n']}, kelong={best_fit_global['kelong']:.2e}")
-    else:
-        print("Global fit failed to converge.")
+    print(f"Done. Results saved to fit_summary_independent.csv")
 
 if __name__ == "__main__":
     main()
