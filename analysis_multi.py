@@ -5,7 +5,6 @@ import warnings
 import sys
 from scipy.optimize import least_squares
 
-# Silence version-specific warnings
 warnings.filterwarnings("ignore")
 
 try:
@@ -18,10 +17,8 @@ except ImportError as e:
 def safe_residuals(theta, t, P_exp, n, A_func, model_type):
     keff, kelong, krise = theta
     params = {'keff': keff, 'n': n, 'kelong': kelong, 'krise': krise}
-    
-    # Model switching logic
     if model_type == 'standard':
-        params['krise'] = 1e8  # Instant unpacking
+        params['krise'] = 1e8
         params['f_visible'] = 1.0
     else:
         params['f_visible'] = P_exp[0]
@@ -37,16 +34,14 @@ def safe_residuals(theta, t, P_exp, n, A_func, model_type):
 
 def fit_independent_peaks(t, I_matrix, peak_names, nmin, nmax, kelong_guess, A_func):
     summary = []
+    total = len(peak_names)
     for i, peak in enumerate(peak_names):
         I_raw = I_matrix[:, i]
+        max_val = np.nanmax(I_raw)
+        if max_val <= 0 or np.isnan(max_val): continue
         
-        # Internal normalization to the peak of the curve
-        max_val = np.max(I_raw)
         P_exp = I_raw / max_val 
-        
-        # Detect if peak grows (Rise & Fall) or just decays (Standard)
         model_type = 'rise_fall' if max_val > I_raw[0] * 1.05 else 'standard'
-
         best_rmse = np.inf
         best_fit = None
 
@@ -61,32 +56,23 @@ def fit_independent_peaks(t, I_matrix, peak_names, nmin, nmax, kelong_guess, A_f
                         ftol=1e-2
                     )
                     kef, kel, kri = res_lsq.x
-                    
-                    # Verify fit stats
                     p_f = {'keff': kef, 'n': n_cand, 'kelong': kel, 
                            'krise': kri if model_type == 'rise_fall' else 1e8,
                            'f_visible': P_exp[0] if model_type == 'rise_fall' else 1.0}
-                    
                     sol = solve_kinetics((t[0], t[-1]), 1.0, p_f, A_func, t_eval=t)
                     stats = fit_statistics(P_exp, sol.y[1])
-
                     if stats["RMSE"] < best_rmse:
                         best_rmse = stats["RMSE"]
                         best_fit = {"peak": peak, "n": n_cand, "keff": kef, "kelong": kel, 
                                     "krise": p_f['krise'], "type": model_type, "stats": stats}
-                except:
-                    continue
-
-        if best_fit:
-            summary.append(best_fit)
-            if (i+1) % 10 == 0:
-                print(f"  Fitted {i+1}/{len(peak_names)} peaks...")
-
+                except: continue
+        if best_fit: summary.append(best_fit)
+        if (i+1) % 10 == 0: print(f"  Processed {i+1}/{total} peaks...")
     return summary
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, required=True, help="Path to int.csv")
+    parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--p0", type=float, required=True)
     parser.add_argument("--nmin", type=int, default=1)
     parser.add_argument("--nmax", type=int, default=4)
@@ -94,27 +80,29 @@ def main():
     args = parser.parse_args()
 
     try:
-        # 1. Load the row-oriented CSV (Residues as rows, Time as columns)
-        df_raw = pd.read_csv(args.data, index_col=0)
+        # Load without index first to see the structure
+        df_raw = pd.read_csv(args.data)
         
-        # 2. Transpose it (Now Rows = Time, Columns = Residues)
+        # If 'time' is a column, set it as index, then transpose
+        if 'time' in df_raw.columns:
+            df_raw = df_raw.set_index('time')
+        
+        # Transpose so Rows = Time, Columns = Residues
         df = df_raw.T
         
-        # 3. Fix the Time index (convert headers to numeric)
+        # Clean the index (Time values)
         df.index = pd.to_numeric(df.index, errors='coerce')
         df = df[df.index.notnull()]
         df = df.sort_index()
         
-        # 4. Interpolate NaNs (fills small gaps so we don't drop the whole residue)
-        df = df.replace(['None', 'nan', 'NaN'], np.nan)
-        df = df.interpolate(method='linear', limit_direction='both')
-        
-        # 5. Drop only if a residue is COMPLETELY empty
-        df = df.dropna(axis=1, how='all')
+        # Clean the data (Intensities)
+        df = df.apply(pd.to_numeric, errors='coerce')
+        df = df.interpolate(method='linear', axis=0, limit_direction='both')
+        df = df.dropna(axis=1, how='any')
 
         t = df.index.values
         peak_names = df.columns.tolist()
-        I_matrix = df.values.astype(float)
+        I_matrix = df.values
         
         print(f"Loaded {len(peak_names)} residues across {len(t)} timepoints.")
     except Exception as e:
@@ -122,24 +110,18 @@ def main():
         sys.exit(1)
 
     if len(peak_names) == 0:
-        print("Still no valid residues found. Check for non-numeric values in int.csv")
+        print("Still no valid residues found. Check if your CSV separator is a comma.")
         sys.exit(1)
 
     def A_func(t): return 1.0 
-
-    print(f"Processing {len(peak_names)} peaks...")
+    print(f"Starting fits...")
     summary = fit_independent_peaks(t, I_matrix, peak_names, args.nmin, args.nmax, args.kelong, A_func)
     
-    if not summary:
-        print("All fits failed. Time range: {t[0]} to {t[-1]}")
-        sys.exit(1)
-
     with open("fit_summary_independent.csv", "w") as f:
         f.write("peak,type,n,keff,kelong,krise,RMSE\n")
         for res in summary:
             f.write(f"{res['peak']},{res['type']},{res['n']},{res['keff']:.3e},{res['kelong']:.3e},{res['krise']:.3e},{res['stats']['RMSE']:.2e}\n")
-
-    print(f"Success. Results saved to fit_summary_independent.csv")
+    print(f"Success. Results in fit_summary_independent.csv")
 
 if __name__ == "__main__":
     main()
